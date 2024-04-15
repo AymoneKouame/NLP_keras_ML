@@ -1,0 +1,475 @@
+---
+title: "exam3"
+author: "Aymone Kouame"
+date: "8/5/2019"
+output:
+  word_document: default
+  html_document: default
+---
+The data file below contains whether patients died in a six-month period following surgery ("died" in the data set). Two different types of surgery were performed ("surgerytype" in the dataset) and allocation to surgery type was of course not random: Decisions results from a combination of Dr. recommendations and patient's decisions. A number of variables about the patient are also included. Determine whether one type of surgery is more likely to result in death (the effect of surgery type on death)
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(readxl)
+library(car)
+library(dplyr)
+library(Matching)
+library(MatchIt)
+library(dplyr)
+library(twang)
+library(survey)
+library(party)
+library(rgenoud)
+library(rbounds)
+library(ggplot2)
+
+```
+
+1. Getting our surgery data ready
+```{r}
+surgery_data <- readxl::read_xlsx('Exam3Q1.xlsx')
+head(surgery_data)
+```
+
+```{r}
+#factoring numeric categorical variables and scaling continous variables
+# we want to predict death
+
+surgery_data$severe <- factor(surgery_data$severe)
+surgery_data$cognitivedecline <- factor(surgery_data$cognitivedecline)
+surgery_data$depression <- factor(surgery_data$depression)
+surgery_data$cancer <- factor(surgery_data$cancer)
+surgery_data$autoimmune <- factor(surgery_data$autoimmune)
+surgery_data$transferedin <- factor(surgery_data$transferedin)
+
+surgery_data$age <- scale(surgery_data$age)
+surgery_data$yearseducation <- scale(surgery_data$yearseducation)
+surgery_data$bloodpressure <- scale(surgery_data$bloodpressure)
+surgery_data$temperature<- scale(surgery_data$temperature)
+surgery_data$creatinelevels<- scale(surgery_data$creatinelevels)
+surgery_data$sodiumlevels<- scale(surgery_data$sodiumlevels)
+surgery_data$urineweight<- scale(surgery_data$urineweight)
+surgery_data$kg<- scale(surgery_data$kg)
+surgery_data$income<- scale(surgery_data$income)
+```
+
+```{r}
+levels(factor(surgery_data$insurancetype)) # finding the different types of insurance
+surgery_data$insurance <- ifelse(surgery_data$insurancetype == 'No insurance', 0, 1) #coding 0 for no insurance and 1 for any type of insurance
+```
+
+```{r}
+#coding character factors as numeric to avoid running into issues later when calculating propensity scores
+
+# finding the different levels 
+levels(factor(surgery_data$nolifesupportorder)) 
+levels(factor(surgery_data$resp))
+levels(factor(surgery_data$trauma))
+levels(factor(surgery_data$race))
+
+
+# coding as 1 for yes and 0 for no
+# finding the different levels 
+surgery_data$nolifesupportorder1 <- ifelse(surgery_data$nolifesupportorder == 'Yes', 1,0)
+surgery_data$resp1 <- ifelse(surgery_data$resp == 'Yes', 1,0)
+surgery_data$trauma1 <- ifelse(surgery_data$trauma == 'Yes', 1,0)
+surgery_data$white <- ifelse(surgery_data$race == 'white', 1,0)
+surgery_data$male<- ifelse(surgery_data$sex == 'Male', 1,0)
+```
+
+ A - Select relevant covariates
+For our analysis, we want to select covariates that are True Confounders and Outcome Proxies, that is covariates that predict both surgerytpe and death, and/or covariate that only predict death; but we do not want covariates that only predict surgery type.
+
+Let's build a glm model to decide which ones to keep
+```{r}
+##seeing which covariates predict surgerytype
+surgeryp <- glm(surgerytype ~ severe + cognitivedecline + depression + cancer + autoimmune + transferedin + bloodpressure + temperature + creatinelevels + sodiumlevels + urineweight + kg + resp1 + infection + trauma1 + age + male + yearseducation + nolifesupportorder1 + insurance + white + income, data = surgery_data, family = 'binomial')
+
+
+##seeing which covariates predict death
+ 
+  #including only the covariates that seem to predict death
+deathp <- glm(died ~ severe + cognitivedecline + depression + cancer + autoimmune + transferedin + bloodpressure + temperature + creatinelevels + sodiumlevels + urineweight + kg + resp1 + infection + trauma1 + age + male + yearseducation + nolifesupportorder1 + insurance + white + income, data = surgery_data, family = 'binomial')
+
+```
+
+```{r}
+summary(surgeryp)
+summary(deathp)
+``` 
+# covariates to use
+Cognitivedecline, cancer, transferedin, bloodpressure, creatinelevels, kg, resp, trauma, nolifesupportorder are true confounders. We definetitely want to include them
+Autoimmune,temperature, age, sex and income are outcome proxys. We can include them as well.
+
+```{r}
+# check for mutlicolinearity issues
+
+vif(surgeryp)
+vif(deathp)
+``` 
+We do not seem to have an issue with multicolinearity.
+
+B - Decide how to deal with missing data (imputation or removal)
+```{r}
+#It seems that there are no missing data; let's check
+levels(factor(is.na(surgery_data)))
+
+```
+Great! we do not have any missing data. We can calculate our propensity scores
+
+2. PROPENSITY SCORES: Trying out at least two methods to calculate our propensity scores
+We are performing regression to predict assignment to one surgery type or the other using the covariates we selected earlier
+## SIMPLE LOGIT MODEL
+```{r}
+
+psformula <- formula("surgerytype ~ cognitivedecline + cancer + transferedin + bloodpressure + creatinelevels + kg + resp1 + trauma1 + nolifesupportorder1 + autoimmune + temperature + age + male + income")
+logitmodel <- glm(psformula, family = "binomial", data = surgery_data)
+
+#Estimatating propensity scores for each participant.
+surgery_data$logitscored <- fitted(logitmodel)
+
+#Plotting
+surgery_data %>%
+ggplot(aes(x = logitscored)) +
+geom_histogram(color = "blue") +
+facet_wrap(~surgerytype) +
+xlab("logit")
+boxplot(logitscored~surgerytype, data = surgery_data)
+
+```
+We see quite a bit of common support or overlap. Let's try forest method
+
+## FOREST
+```{r}
+ct <- cforest_unbiased(ntree = 1000, mtry = 3) 
+forestmodel <- cforest(psformula, data = surgery_data, controls = ct)
+surgery_data$forestfit <- predict(forestmodel, type="prob")
+surgery_data$forestfit <- as.numeric(surgery_data$forestfit)
+
+#Plotting
+surgery_data %>%
+ggplot(aes(x = forestfit)) +
+geom_histogram(color = "green") +
+facet_wrap(~surgerytype) +
+xlab("forest")
+boxplot(forestfit~surgerytype, data = surgery_data)
+
+```
+
+We seem to have less overlap with the Forest method. but we can't be completely sure. We will use both PS for the remainder of the analysis. Now, We will check covariable imbalance to be sure. We will use Weighting and Stratification.
+
+3. Minimizing the imbalance in covariates:
+## WEIGHTING
+```{r}
+#logit
+surgery_data$ATTweight <- with(surgery_data, ifelse(surgerytype == 1, 1, logitscored/(1-logitscored)))
+
+with(surgery_data, by(ATTweight, surgerytype, summary))
+
+#forest
+surgery_data$ATTweightf <- with(surgery_data, ifelse(surgerytype == 1, 1, forestfit/(1-forestfit)))
+
+with(surgery_data, by(ATTweightf, surgerytype, summary))
+```
+We do see some extreme weights with logit but less extremes with forest.Let's try to use corrected weights
+
+```{r}
+#logit
+surgery_data$corrected_ATTweight <- with(surgery_data, ifelse(surgerytype == 1, mean(logitscored)/logitscored, mean(1-logitscored)/(1-logitscored)))
+
+with(surgery_data, by(corrected_ATTweight, surgerytype, summary))
+
+#forest
+surgery_data$corrected_ATTweightf <- with(surgery_data, ifelse(surgerytype == 1, mean(forestfit)/forestfit, mean(1-forestfit)/(1-forestfit)))
+
+with(surgery_data, by(corrected_ATTweightf, surgerytype, summary))
+
+```
+
+The weights still look imbalanced logit for . Let's try truncating method for logit only. 
+```{r}
+surgery_data$trunc_ATTweight <- with(surgery_data, ifelse(ATTweight > quantile(ATTweight, .99), quantile(ATTweight, .99), ATTweight))
+
+with(surgery_data, by(trunc_ATTweight, surgerytype, summary))
+
+```
+There is significant improvement with the truncate method on logit but the forest PS still give the the best results.
+
+
+ ##Balancce checks
+ 
+```{r}
+#logit
+check <- svydesign(ids = ~0, weights = surgery_data$trunc_ATTweight, data = surgery_data)
+
+balCheck <- bal.stat(check$variables, estimand = "ATT", w.all = surgery_data$trunc_ATTweight, vars = cbind("cognitivedecline", "cancer", "transferedin", "bloodpressure", "creatinelevels", "kg","resp1","trauma1","nolifesupportorder1", "autoimmune", "temperature", "age" , "male", "income"), sampw = 1, get.ks = FALSE,  treat.var = "surgerytype", multinom = FALSE)
+
+balCheck$results
+
+
+#forest
+checkf <- svydesign(ids = ~0, weights = surgery_data$corrected_ATTweightf, data = surgery_data)
+
+balCheckf <- bal.stat(checkf$variables, estimand = "ATT", w.all = surgery_data$corrected_ATTweightf, vars = cbind("cognitivedecline", "cancer", "transferedin", "bloodpressure", "creatinelevels", "kg","resp1","trauma1","nolifesupportorder1", "autoimmune", "temperature", "age" , "male", "income"), sampw = 1, get.ks = FALSE,  treat.var = "surgerytype", multinom = FALSE)
+
+balCheckf$results
+```
+ The balances looks great for both methods now. We have successfully minimized the imbalance in covariates. Now let's estimate the treatment effect. Because our balances look great, we can use a simple glm model
+ 
+ ## Estimating the effect using a simple glm and using both types of PS
+ 
+```{r}
+#logit
+#simple GLM to perform logistic regression taking our truncated weights into account :
+
+model <- glm (died ~ surgerytype, weights = trunc_ATTweight, data = surgery_data, family = "binomial") 
+
+```
+
+```{r}
+#forest
+#simple GLM to perform logistic regression taking our truncated weights into account :
+
+modelf <- glm (died ~ surgerytype, weights = corrected_ATTweightf, data = surgery_data, family = "binomial") 
+
+```
+
+```{r}
+summary(model)
+summary(modelf)
+```
+
+
+
+```{r}
+           
+anova(model, modelf)
+```
+
+Model 1 has a lower standard of error than model 2 (5589.8 versus 6462.6)and a better fit (872.76 smaller deviance). Therefore the model built with the logit PS scores is the best.
+# sensitivity analysis 
+Since I am not able to install the 'treatSens' package, the following sensitivity analysis will be used
+```{r}
+gd <- with(surgery_data, Match(Y = died, Tr = surgerytype, X = trunc_ATTweight, estimand = 'ATT', M = 1, replace = F, ties = F))
+psens(gd, Gamma = 10, GammaInc = .1)
+
+```
+ We find with a bias as small as 1.2 we could find a non-significant result (p value >0.05). This means that the model is sensitive to lurking covariates.
+
+```{r}
+#trying with forest scores
+gd2 <- with(surgery_data, Match(Y = died, Tr = surgerytype, X = corrected_ATTweightf, estimand = 'ATT', M = 1, replace = F, ties = F))
+psens(gd2, Gamma = 10, GammaInc = .1)
+```
+ We also find with a bias as small as 1.2 we could find a non-significant result (p value >0.05). This means that the model is sensitive to lurking covariates. but the model built with forest scores is more sensitive than the one built with logit scores
+
+Overall, the model built with the logit score yields better results and is slightly less sensitive. WHY???????
+
+## STRATIFICATION
+
+```{r}
+surgery_data$logLogit <- log(surgery_data$logitscored/(1- surgery_data$logitscored))
+surgery_data$logForest <- log(surgery_data$forestfit/(1- surgery_data$forestfit))
+```
+
+```{r}
+# creating stratum using quantile of conditions
+strat <- matchit(psformula, data = surgery_data, distance = surgery_data$logLogit, 
+method = 'subclass', sub.by = 'treat')
+
+#stratified data
+stratum <- match.data(strat)
+```
+
+# checking for imbalances 
+whether there is balance within each stratum
+```{r}
+check_bal <- summary(strat, standardize = TRUE)
+# Now let's see  the standardized mean differences in covariates by stratum \
+std_md <- data.frame(check_bal$q.table[,3,])
+summary(std_md)
+
+summary(abs(check_bal$sum.subclass$"Std. Mean Diff."))
+
+table(abs(check_bal$sum.subclass$"Std. Mean Diff.")  > 0.1)
+
+```
+We have a threshold of .1 strict cut off or less conservative cutoff of 0.25. We are above. we will try the forest ps to see if there is improvement
+
+```{r}
+stratf <- matchit(psformula, data = surgery_data, distance = surgery_data$logForest, method = "subclass", sub.by = "treat")
+check_balf <- summary(stratf, standardize = TRUE)
+std_mdf <- data.frame(check_balf$q.table[,3,])
+summary(std_mdf)
+
+```
+We are still above the cutoffs. Logit PS actually provide better results.
+
+# 3.checking and minimizing imbalances
+
+## MARGINAL MEAN WEIGHTING
+We chose this method because it is great at correcting imbalances in stratum by assigning weights to the strata
+```{r}
+# generate a merged table with the count of treated/untreated cases oer stratum
+designl <- svydesign(id = ~0, data = stratum)
+
+treatl<- data.frame(table(stratum$subclass[stratum$surgerytype == 1]))
+names(treatl) <- c("subclass", "N.1s")  # for merges to work properly
+
+controll <- data.frame(table(stratum$subclass[stratum$surgerytype == 0]))
+names(controll) <- c("subclass", "N.0s") # for merges to work properly
+
+countl <- merge(treatl, controll)
+
+## merge counts with our data
+stratum<- merge(stratum, countl)
+
+# get the marginal proportions
+proportion_l <- svymean(~factor(surgerytype), designl)
+
+stratum$w_norm <- with(stratum, ifelse(surgerytype == 1, 1, stratum$N.1s*proportion_l[1]/stratum$N.0s*proportion_l[2]))
+xtabs(~w_norm  +subclass, stratum)  
+
+```
+
+```{r}
+stratum$ATTweight  <- stratum$w_norm/mean(stratum$w_norm)
+normtablel <- bal.stat(stratum, estimand = 'ATT', w.all = stratum$ATTweight, vars = cbind("cognitivedecline", "cancer", "transferedin", "bloodpressure", "creatinelevels", "kg","resp1","trauma1","nolifesupportorder1", "autoimmune", "temperature", "age" , "male", "income"), sampw = 1,get.ks = FALSE,  treat.var = "surgerytype", multinom = FALSE)
+
+normtablel$results
+```
+
+
+The balance is still not very good. The values are above thresholds of .1 cutoff or .2. Lets see if we get better results if we use the forest fit.
+
+```{r}
+
+## with forest PS
+stratumf <- match.data(stratf)
+
+# generate a merged table with the count of treated/untreated cases oer stratum
+designf <- svydesign(id = ~0, data = stratumf)
+treatf<- data.frame(table(stratumf$subclass[stratumf$surgerytype == 1]))
+names(treatf) <- c("subclass", "N.1s")  # for merges to work properly
+controlf <- data.frame(table(stratumf$subclass[stratumf$surgerytype == 0]))
+names(controlf) <- c("subclass", "N.0s") # for merges to work properly
+countf <- merge(treatf, controlf)
+
+## merge counts with our data
+stratum_f<- merge(stratumf, countf)
+
+# get the marginal proportions
+proportion_f <- svymean(~factor(surgerytype), designf)
+
+stratum_f$w_norm <- with(stratum_f, ifelse(surgerytype == 1, 1, stratum_f$N.1s*(proportion_f[1])/(stratum_f$N.0s*(proportion_f[2]))))
+xtabs(~w_norm+subclass, stratum_f)
+
+## weight
+stratum_f$ATTweight  <- stratum_f$w_norm/mean(stratum_f$w_norm)
+normtable_f <- bal.stat(stratum_f, estimand = 'ATT', w.all = stratum_f$ATTweight, vars = cbind("cognitivedecline", "cancer", "transferedin", "bloodpressure", "creatinelevels", "kg","resp1","trauma1","nolifesupportorder1", "autoimmune", "temperature", "age" , "male", "income"), sampw = 1,get.ks = FALSE,  treat.var = "surgerytype", multinom = FALSE)
+
+normtable_f$results
+
+
+```
+
+Forest PS, again, does not provide better results. The data is more imbalanced here. Also, we will use from now on, the PS and strata achieved with the logit model.
+
+Because we do not have good results balancce-wise, let's try boostrapping.
+```{r}
+finaldesign_st <- svydesign(ids = ~0, weights = stratum$ATTweight, data = stratum)
+finaldesign_st <- as.svrepdesign(finaldesign_st, type = c("bootstrap"), replicates = 5000)
+
+model_st <- svyglm(died ~ surgerytype + cognitivedecline + cancer + transferedin + bloodpressure+ creatinelevels+ kg + resp1 + trauma1+ nolifesupportorder1 + autoimmune + temperature + age + male+ income , design = finaldesign_st, family = gaussian()) 
+
+summary(model_st)
+```
+
+## Sensitity Analysis
+```{r}
+gd_st <- with(surgery_data, Match(Y = died, Tr = surgerytype, X = logitscored, estimand = 'ATT', M = 1, replace = F, ties = F))
+psens(gd_st, Gamma = 10, GammaInc = .1)
+
+```
+ We find with a bias of 1.3 we could find a non-significant result (p value >0.05). This means that the model is sensitive to lurking covariates but is less sensitive than the model built during weighting.
+
+```{r}
+surgery_data$prediction <- predict.glm(model_st, surgery_data, type = 'terms')
+
+predicted_death <- as.data.frame(cbind(surgery_data$surgerytype, as.data.frame(surgery_data$prediction)))
+
+predicted_death <- predicted_death[order(predicted_death$surgerytype),]
+
+predicted_death 
+
+as.data.frame(surgery_data$prediction)
+```
+
+# SUMMARY OF ANAYLIS AND FINAL CONCLUSIONS FOR PROPENSITY SCORE ANALYSIS
+We analyzed the surgery data file to determine whether one type of surgery is more likely to result in death (the effect of surgerytype on death). Our dependent variable was a binary one called 'died' and the indeoendent variable was surgerytype. 
+
+First, we worked on getting the data ready for analysis. We scaled all the continous variables and factored all numeric categorical variables, except the deoendent variable. For the character categorical variables, we created binary dummy variables. 
+Then, we built two glm models, one with the treatment (surgerytype) as dependent variable and one with the outcome (died) as dependent variable. We then selected as covariates to use: Cognitivedecline, cancer, transferedin, bloodpressure, creatinelevels, kg, resp, trauma and nolifesupportorder which are true confounders, and autoimmune,temperature, age, sex and income , which are outcome proxys. 
+After verifyng that we do not have missing data in the dataset, we moved to the calculating propensity scores.
+
+# 1. calculating our propensity scores 
+We use the logit method and the forest methods. After plotting the scores, we saw a lot more common support or overlap with the logit method but decided to continue the analysis using both types of scores.
+
+# 2. checking for imbalances
+We checked for imbalances using both logit and forest PS scores. The forest method yieled more balanced results. We performed correction of extreme weights on the logit weights but the forest weights still yieled the more balanced results.
+
+# 3. minimizing the imbalance in covariates and estimating effects
+We decided to do both Weighting and stratification.
+#Weighting
+we calculated PS using both logit weight and forest weights. We successfully minimized the imbalance in covariates. Using two simple glm models, we estimated the treatment effects
+
+we found that the model built with the logit PS scores was the best.
+Coefficients:
+            Estimate Std. Error z value Pr(>|z|)    
+(Intercept)  0.47989    0.04444  10.799  < 2e-16 ***
+surgerytype  0.27573    0.06388   4.317 1.58e-05 ***
+
+It shows that surgerytype indeed has a significant (p value < 0.05) positive effect (+0.27573) on whether a patient died or not. the SE is 0.06388. The null deviance is 5608.5  on 5734  degrees of freedom and the residual deviance: 5589.8  on 5733  degrees of freedom
+
+# stratification
+We created our strata, checked and corrected imbalances using marginal mean weighting. We perfomed this for both logit PS scores and forest PS scores. The data was imbalanced and went over the thresholds of .1 and .2. Marginal mean wighting helped to correct some of these imbalances but we were still above the cutoffs. Logit PS provided better results though.
+We therefore decided to build a glm model with boostrapping, including all the covariates and using the stratum built with logit PS scores.
+
+
+Coefficients:
+                     Estimate Std. Error t value Pr(>|t|)    
+(Intercept)          0.548077   0.017114  32.025  < 2e-16 ***
+surgerytype          0.064988   0.013613   4.774 1.86e-06 ***
+cognitivedecline1    0.060347   0.027253   2.214 0.026854 *  
+cancer1              0.161863   0.018545   8.728  < 2e-16 ***
+transferedin1       -0.070933   0.024290  -2.920 0.003513 ** 
+bloodpressure       -0.029097   0.008793  -3.309 0.000943 ***
+creatinelevels       0.029680   0.007596   3.908 9.45e-05 ***
+kg                  -0.024199   0.008765  -2.761 0.005787 ** 
+resp1               -0.016887   0.017777  -0.950 0.342187    
+trauma1             -0.160419   0.073546  -2.181 0.029214 *  
+nolifesupportorder1  0.173821   0.021313   8.156 4.36e-16 ***
+autoimmune1          0.069392   0.017191   4.037 5.50e-05 ***
+temperature         -0.029098   0.007760  -3.750 0.000179 ***
+age                  0.077230   0.008709   8.868  < 2e-16 ***
+male                 0.017454   0.016251   1.074 0.282850    
+income              -0.016069   0.007801  -2.060 0.039465 *  
+
+Again, we see that these covariates, except for male and resp, have a significant effect on whether a person dies after a surgery. 
+
+Overall the model build via stratification yieled better and more significant results with a SE of 0.013613 for surgerytype vs  0.06388 with weighting .
+
+#4. sensitivity analysis
+We found that our models were sensitive. With a bias of 1.3 we could find a non-significant result (p value >0.05). This means that the model is sensitive to lurking covariates. The stratification model is less sensitive than the model built during weighting.
+
+## CONCLUSIONS
+Both stratification and weighting showed that surgery type hass a significant effect on patient's death.
+Stratification with bootstrapping showed that surgerytype, cognitive decline, having cancer, having no life support, having an automimmune problem, creatinine levels and age, positively and significalty affect death after surgery. Other variables such as being transferd in, having blodd pressure, weight, temperature and income seem to negatively and significantly affect death outcome. 
+
+However, these conclusions should not be held as final since the data is not randomized. The results will always have some bias. Also, the models are very sensitive to outside variables, meaning there probably are other factors that could contribute even more significanly to the death of a patient after surgery.
